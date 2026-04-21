@@ -3,90 +3,96 @@ import axios from 'axios';
 import { PrismaClient } from '@prisma/client';
 import * as dotenv from 'dotenv';
 import cors from '@fastify/cors';
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 
-// Загружаем переменные из .env
+// 1. Настройка окружения
 dotenv.config();
 
 const fastify = Fastify({ logger: true });
 const prisma = new PrismaClient();
 
-// Подключаем Redis (убедись, что Docker запущен)
 const redis = new Redis({
-  host: 'localhost',
+  host: '127.0.0.1', 
   port: 6379,
+  lazyConnect: true, 
 });
 
-// РЕГИСТРИРУЕМ CORS: без этого фронтенд на порту 3001 не сможет сделать запрос
+redis.on('error', (err: any) => {
+  console.warn('Redis connection error. Working without cache.');
+});
+
+// 3. Регистрация CORS (обязательно для связи с фронтендом)
 await fastify.register(cors, {
-  origin: true, // В учебных целях разрешаем всем, для продакшена пишут адрес фронтенда
+  origin: true, 
 });
 
-// Типизация для запроса
+// Типизация для запроса города
 interface WeatherQuery {
   city: string;
 }
 
-// Главный роут для проверки
-fastify.get('/', async () => {
-  return { status: 'OK', message: 'Weather Meme API is active' };
-});
-
-// Основная логика: Погода + Мем
+// 4. Основной маршрут
 fastify.get('/weather', async (request, reply) => {
   const { city } = request.query as WeatherQuery;
 
   if (!city) {
-    return reply.code(400).send({ error: 'City name is required' });
+    return reply.code(400).send({ error: 'City is required' });
   }
 
   try {
-    // 1. Пытаемся найти данные в кэше Redis
-    const cachedData = await redis.get(city.toLowerCase());
-    if (cachedData) {
-      console.log(`--- [Redis] Данные для ${city} взяты из кэша ---`);
-      return JSON.parse(cachedData);
+    const cityKey = city.toLowerCase().trim();
+
+    // Пытаемся взять данные из кэша Redis
+    const cached = await redis.get(cityKey);
+    if (cached) {
+      fastify.log.info('Данные получены из Redis кэша');
+      return JSON.parse(cached);
     }
 
-    // 2. Если в кэше нет — идем в OpenWeatherMap
+    // Если в кэше нет — идем в OpenWeatherMap API
     const apiKey = process.env.WEATHER_API_KEY;
-    const weatherUrl = `https://api.openweathermap.org/data/2.5/weather?q=${city}&appid=${apiKey}&units=metric`;
+    const weatherUrl = `https://api.openweathermap.org/data/2.5/weather?q=${cityKey}&appid=${apiKey}&units=metric`;
     
     const weatherRes = await axios.get(weatherUrl);
-    const temp = weatherRes.data.main.temp;
-    const condition = weatherRes.data.weather[0].main; // Например: 'Clear', 'Rain', 'Clouds'
+    const temp = Math.round(weatherRes.data.main.temp);
+    const condition = weatherRes.data.weather[0].main; // Например: Clear, Clouds, Rain
 
-    // 3. Ищем мем в базе PostgreSQL через Prisma
+    // Ищем подходящий мем в PostgreSQL через Prisma
     const meme = await prisma.meme.findFirst({
       where: { weatherCategory: condition },
     });
 
-    // Формируем финальный объект
-    const responseData = {
+    // Формируем объект ответа
+    const result = {
       city: weatherRes.data.name,
-      temp: `${Math.round(temp)}°C`,
+      temp: `${temp}°C`,
       condition: condition,
       meme: meme || { 
         url: 'https://via.placeholder.com/300', 
-        description: 'Мем для такой погоды еще не завезли' 
+        description: 'Мем для такой погоды еще не добавлен' 
       }
     };
 
-    // 4. Сохраняем результат в Redis на 10 минут (600 секунд)
-    await redis.set(city.toLowerCase(), JSON.stringify(responseData), 'EX', 600);
+    // Сохраняем в Redis на 10 минут (600 секунд)
+    await redis.set(cityKey, JSON.stringify(result), 'EX', 600);
 
-    return responseData;
+    return result;
 
   } catch (error: any) {
     fastify.log.error(error);
     return reply.code(error.response?.status || 500).send({ 
-      error: 'Ошибка при получении данных',
+      error: 'City not found or API error',
       details: error.response?.data?.message || error.message 
     });
   }
 });
 
-// Запуск сервера
+// Вспомогательный роут для проверки работоспособности
+fastify.get('/', async () => {
+  return { status: 'OK', message: 'Backend is running' };
+});
+
+// 5. Запуск сервера
 const start = async () => {
   try {
     await fastify.listen({ port: 3000, host: '0.0.0.0' });
